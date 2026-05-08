@@ -66,12 +66,12 @@ def analyze():
         avg_h = sum(heights) / len(heights)
 
         # Convert to realistic dental ranges (mm)
-        width  = round((avg_w / 10) + 6, 2)
-        height = round((avg_h / 10) + 8, 2)
-        depth  = round((width + height) / 5, 2)
+        width  = round((avg_w / 8) + 10, 2)
+        height = round((avg_h / 8) + 12, 2)
+        depth  = round((width + height) / 4, 2)
 
         # Estimate volume
-        volume = round((width * height * depth) / 10, 2)
+        volume = round((width * height * depth) / 4, 2)
 
         max_dim = max(width, height, depth)
 
