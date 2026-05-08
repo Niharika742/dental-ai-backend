@@ -39,7 +39,7 @@ def analyze():
             cv2.CHAIN_APPROX_SIMPLE
         )
 
-        scale = 1.0
+        scale = 0.1
         widths = []
         heights = []
 
