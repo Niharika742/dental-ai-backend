@@ -45,51 +45,58 @@ def analyze():
 
         for c in contours:
             area = cv2.contourArea(c)
+
             if 500 < area < 200000:
                 x, y, w, h = cv2.boundingRect(c)
+
                 widths.append(w * scale)
                 heights.append(h * scale)
 
-        # If no valid contours detected, return early
+        # No contours found
         if len(widths) == 0:
             return jsonify({
                 'width': '0',
                 'height': '0',
                 'depth': '0',
                 'volume': '0',
+                'scaffoldRange': 'None',
                 'material': 'None',
                 'findings': 'No significant bone defect region detected.'
             })
 
-        # Compute average dimensions
+        # Average dimensions
         avg_w = sum(widths) / len(widths)
         avg_h = sum(heights) / len(heights)
 
-        # Convert to realistic dental ranges (mm)
-        width  = round((avg_w / 8) + 10, 2)
+        # Convert to realistic dental dimensions (mm)
+        width = round((avg_w / 8) + 10, 2)
         height = round((avg_h / 8) + 12, 2)
-        depth  = round((width + height) / 4, 2)
+        depth = round((width + height) / 4, 2)
 
-        # Estimate volume
-        volume = round((width * height * depth) / 4, 2)
+        # Realistic scaffold volume
+        volume = round(width * height * depth, 2)
 
-        max_dim = max(width, height, depth)
+        # Scaffold recommendation
+        if volume > 0 and volume <= 300:
+            scaffoldRange = 'Small Scaffold'
+            material = 'Collagen + Hydroxyapatite (HA)'
 
-        # Scaffold material suggestion
-        if max_dim < 5:
-            material = 'Collagen scaffold'
-        elif max_dim <= 10:
-            material = 'Hydroxyapatite + collagen composite'
+        elif volume > 300 and volume <= 1000:
+            scaffoldRange = 'Medium Scaffold'
+            material = 'Hydroxyapatite (HA) + β-TCP'
+
         else:
-            material = '3D printed scaffold'
+            scaffoldRange = 'Large Scaffold'
+            material = 'PCL/PLA + HA Composite Scaffold'
 
         findings = 'Possible bone defect region detected from radiograph.'
 
         return jsonify({
-            'width':    str(width),
-            'height':   str(height),
-            'depth':    str(depth),
-            'volume':   str(volume),
+            'width': str(width),
+            'height': str(height),
+            'depth': str(depth),
+            'volume': str(volume),
+            'scaffoldRange': scaffoldRange,
             'material': material,
             'findings': findings
         })
@@ -100,5 +107,11 @@ def analyze():
 
 if __name__ == '__main__':
     import os
-port = int(os.environ.get('PORT', 5000))
-app.run(host='0.0.0.0', port=port)
+
+    port = int(os.environ.get('PORT', 5000))
+
+    app.run(
+        host='0.0.0.0',
+        port=port,
+        debug=True
+    )
