@@ -61,7 +61,7 @@ ai_models = {
 le_tooth    = load_model('label_encoder_tooth.pkl')
 le_material = load_model('label_encoder_material.pkl')
 
-ai_ready = all(v is not None for v in ai_models.values()) and le_tooth and le_material
+ai_ready = bool(all(v is not None for v in ai_models.values()) and le_tooth is not None and le_material is not None)
 print(f"AI models loaded: {ai_ready}")
 
 
