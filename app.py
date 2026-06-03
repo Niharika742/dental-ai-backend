@@ -334,6 +334,21 @@ def ai_analyze():
 
 
 # ── Run ───────────────────────────────────────────────────────────────────────
+import threading
+import time
+import urllib.request
+
+def keep_alive():
+    while True:
+        try:
+            urllib.request.urlopen('https://dental-ai-backend-1.onrender.com/health')
+        except:
+            pass
+        time.sleep(840)  # ping every 14 minutes
+
+t = threading.Thread(target=keep_alive)
+t.daemon = True
+t.start()
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
