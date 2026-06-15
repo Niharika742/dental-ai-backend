@@ -2,5 +2,5 @@ flask
 flask-cors
 opencv-python-headless
 numpy
-scikit-learn
-joblib
+tensorflow
+gdown
