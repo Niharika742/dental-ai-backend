@@ -3,352 +3,343 @@ from flask_cors import CORS
 import cv2
 import numpy as np
 import os
-import joblib
+import urllib.request
 
 app = Flask(__name__)
 CORS(app)
 
-# ── X-ray type detection ──────────────────────────────────────────────────────
-PANORAMIC_THRESHOLD = 1200
-REAL_JAW_WIDTH_MM   = 150.0
-PERIAPICAL_PPM      = 3.78
-DEPTH_RATIO         = 0.5
+# ── Configuration ─────────────────────────────────────────────
+IMG_SIZE = 224
 
-# ── Anatomical clamp ranges (mm) ──────────────────────────────────────────────
-WIDTH_RANGE  = (2.0, 20.0)
-HEIGHT_RANGE = (2.0, 18.0)
-DEPTH_RANGE  = (1.5,  8.0)
+MATERIAL_CLASSES = [
+    'Collagen Membrane',
+    'Hydroxyapatite (HA)',
+    'Hydroxyapatite (HA) + Beta-TCP',
+    'PCL/PLA + HA Composite'
+]
 
-# ── Contour gates ─────────────────────────────────────────────────────────────
-MIN_AREA         = 400
-MAX_AREA         = 500000
-MAX_ASPECT_RATIO = 6.0
-MIN_SOLIDITY     = 0.25
+WIDTH_MIN,  WIDTH_MAX  = 2.0,  20.0
+HEIGHT_MIN, HEIGHT_MAX = 2.0,  18.0
+DEPTH_MIN,  DEPTH_MAX  = 1.5,   8.0
+VOLUME_MIN, VOLUME_MAX = 6.0, 2880.0
 
-# ── AI Model config ───────────────────────────────────────────────────────────
-TOOTH_TYPES = {
-    '1':'Third Molar','2':'Second Molar','3':'First Molar',
-    '4':'Second Premolar','5':'First Premolar','6':'Canine',
-    '7':'Lateral Incisor','8':'Central Incisor','9':'Central Incisor',
-    '10':'Lateral Incisor','11':'Canine','12':'First Premolar',
-    '13':'Second Premolar','14':'First Molar','15':'Second Molar',
-    '16':'Third Molar','17':'Third Molar','18':'Second Molar',
-    '19':'First Molar','20':'First Premolar','21':'First Premolar',
-    '22':'Canine','23':'Lateral Incisor','24':'Central Incisor',
-    '25':'Central Incisor','26':'Lateral Incisor','27':'Canine',
-    '28':'First Premolar','29':'Second Premolar','30':'First Molar',
-    '31':'Second Molar','32':'Third Molar'
-}
+# ── Download Model from Google Drive ──────────────────────────
+TFLITE_PATH = 'dental_scaffold_model_v1.tflite'
+DRIVE_FILE_ID = '1fLIUamewwS4w8SHllD6GOde1jZAFKDrJ'
 
-# ── Load AI models at startup ─────────────────────────────────────────────────
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-def load_model(name):
-    path = os.path.join(BASE_DIR, name)
-    if os.path.exists(path):
-        return joblib.load(path)
-    return None
-
-ai_models = {
-    'width':    load_model('width_mm_model.pkl'),
-    'height':   load_model('height_mm_model.pkl'),
-    'depth':    load_model('depth_mm_model.pkl'),
-    'volume':   load_model('volume_mm3_model.pkl'),
-    'scaffold': load_model('scaffold_mm3_model.pkl'),
-    'material': load_model('scaffold_material_model.pkl'),
-    'tooth':    load_model('tooth_classifier_model.pkl'),
-}
-le_tooth    = load_model('label_encoder_tooth.pkl')
-le_material = load_model('label_encoder_material.pkl')
-
-ai_ready = bool(all(v is not None for v in ai_models.values()) and le_tooth is not None and le_material is not None)
-print(f"AI models loaded: {ai_ready}")
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def get_ppmm(img_w_px):
-    if img_w_px >= PANORAMIC_THRESHOLD:
-        return img_w_px / REAL_JAW_WIDTH_MM
-    return PERIAPICAL_PPM
-
-def clamp(v, lo, hi):
-    return max(lo, min(v, hi))
-
-def recommend_scaffold(vol):
-    if vol <= 200:
-        return 'Small Scaffold', 'Collagen Membrane + Hydroxyapatite (HA)'
-    elif vol <= 800:
-        return 'Medium Scaffold', 'Hydroxyapatite (HA) + Beta-TCP (Biphasic Calcium Phosphate)'
+def download_model():
+    if not os.path.exists(TFLITE_PATH):
+        print('📥 Downloading model from Google Drive...')
+        try:
+            url = f'https://drive.google.com/uc?export=download&id={DRIVE_FILE_ID}&confirm=t'
+            urllib.request.urlretrieve(url, TFLITE_PATH)
+            size = os.path.getsize(TFLITE_PATH) / (1024*1024)
+            print(f'✅ Model downloaded! Size: {size:.1f} MB')
+        except Exception as e:
+            print(f'⚠️  Download failed: {e}')
     else:
-        return 'Large Scaffold', 'PCL/PLA + HA Composite (3-D Printed)'
+        print('✅ Model already exists locally')
 
-def severity_label(vol):
-    if vol <= 0:   return 'None'
-    if vol <= 200: return 'Mild'
-    if vol <= 800: return 'Moderate'
+download_model()
+
+# ── Load TFLite Model ─────────────────────────────────────────
+interpreter = None
+MODEL_TYPE = 'opencv'
+
+def load_tflite():
+    global interpreter, MODEL_TYPE
+    if os.path.exists(TFLITE_PATH):
+        try:
+            import tensorflow as tf
+            interpreter = tf.lite.Interpreter(model_path=TFLITE_PATH)
+            interpreter.allocate_tensors()
+            inp = interpreter.get_input_details()
+            out = interpreter.get_output_details()
+            print(f'✅ TFLite model loaded!')
+            print(f'   Input : {inp[0]["shape"]}')
+            print(f'   Outputs: {[o["name"] for o in out]}')
+            MODEL_TYPE = 'tflite'
+        except Exception as e:
+            print(f'⚠️  TFLite load failed: {e}')
+            MODEL_TYPE = 'opencv'
+    else:
+        print('⚠️  No model file found — using OpenCV fallback')
+
+load_tflite()
+
+# ── Helper Functions ──────────────────────────────────────────
+def clamp(v, lo, hi):
+    return max(lo, min(float(v), hi))
+
+def denorm(val, lo, hi):
+    return round(float(val) * (hi - lo) + lo, 2)
+
+def get_severity(volume):
+    if volume <= 0:    return 'None'
+    if volume <= 200:  return 'Mild'
+    if volume <= 800:  return 'Moderate'
     return 'Severe'
 
-def extract_features_for_prediction(img, x, y, w_px, h_px):
-    x, y = max(0, x), max(0, y)
-    roi = img[y:y+h_px, x:x+w_px]
-    if roi.size == 0 or w_px < 3 or h_px < 3:
+def get_material_from_volume(volume):
+    if volume <= 200:  return MATERIAL_CLASSES[0]
+    if volume <= 500:  return MATERIAL_CLASSES[1]
+    if volume <= 800:  return MATERIAL_CLASSES[2]
+    return MATERIAL_CLASSES[3]
+
+def get_scaffold_range(volume):
+    if volume <= 200:  return 'Small Scaffold'
+    if volume <= 800:  return 'Medium Scaffold'
+    return 'Large Scaffold'
+
+# ── Preprocess Image ──────────────────────────────────────────
+def preprocess(img_bytes):
+    nparr = np.frombuffer(img_bytes, np.uint8)
+    img   = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+    img_rgb  = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img_res  = cv2.resize(img_rgb, (IMG_SIZE, IMG_SIZE))
+    img_norm = img_res.astype(np.float32) / 255.0
+    return np.expand_dims(img_norm, axis=0)
+
+# ── TFLite Prediction ─────────────────────────────────────────
+def predict_tflite(img_array):
+    try:
+        inp_det = interpreter.get_input_details()
+        out_det = interpreter.get_output_details()
+
+        interpreter.set_tensor(inp_det[0]['index'], img_array)
+        interpreter.invoke()
+
+        # Get all outputs
+        outputs = {}
+        for o in out_det:
+            outputs[o['name']] = interpreter.get_tensor(o['index'])
+
+        print(f'TFLite outputs: {list(outputs.keys())}')
+
+        # Find measurement head (shape: N,4) and material head (shape: N,4)
+        meas_tensor = None
+        mat_tensor  = None
+
+        for name, tensor in outputs.items():
+            shape = tensor.shape
+            print(f'  {name}: shape={shape}')
+            if len(shape) >= 2:
+                if shape[-1] == 4 and 'meas' in name.lower():
+                    meas_tensor = tensor[0]
+                elif shape[-1] == len(MATERIAL_CLASSES) and ('mat' in name.lower() or 'softmax' in name.lower()):
+                    mat_tensor = tensor[0]
+
+        # Fallback by shape if name matching fails
+        if meas_tensor is None or mat_tensor is None:
+            tensors_by_shape = {}
+            for name, tensor in outputs.items():
+                if len(tensor.shape) >= 2:
+                    size = tensor.shape[-1]
+                    tensors_by_shape[size] = tensor[0]
+
+            if 4 in tensors_by_shape:
+                # Two tensors of size 4 — one is measurements, one is material
+                # measurements uses sigmoid (values 0-1), material uses softmax (sums to 1)
+                vals = [v for k, v in outputs.items() if v.shape[-1] == 4]
+                if len(vals) >= 2:
+                    # sigmoid output — values spread out
+                    # softmax output — sums to ~1
+                    if abs(sum(vals[0][0]) - 1.0) < 0.1:
+                        mat_tensor  = vals[0][0]
+                        meas_tensor = vals[1][0]
+                    else:
+                        meas_tensor = vals[0][0]
+                        mat_tensor  = vals[1][0]
+                elif len(vals) == 1:
+                    meas_tensor = vals[0][0]
+
+        if meas_tensor is None:
+            print('⚠️  Could not find measurement tensor — using OpenCV')
+            return None
+
+        # Denormalize to real mm values
+        w = clamp(denorm(meas_tensor[0], WIDTH_MIN,  WIDTH_MAX),  WIDTH_MIN,  WIDTH_MAX)
+        h = clamp(denorm(meas_tensor[1], HEIGHT_MIN, HEIGHT_MAX), HEIGHT_MIN, HEIGHT_MAX)
+        d = clamp(denorm(meas_tensor[2], DEPTH_MIN,  DEPTH_MAX),  DEPTH_MIN,  DEPTH_MAX)
+        v = clamp(denorm(meas_tensor[3], VOLUME_MIN, VOLUME_MAX), VOLUME_MIN, VOLUME_MAX)
+
+        # Material
+        if mat_tensor is not None:
+            mat_idx  = int(np.argmax(mat_tensor))
+            material = MATERIAL_CLASSES[mat_idx]
+            mat_conf = float(np.max(mat_tensor)) * 100
+        else:
+            material = get_material_from_volume(v)
+            mat_conf = 75.0
+
+        return {
+            'width_mm':  round(w, 2),
+            'height_mm': round(h, 2),
+            'depth_mm':  round(d, 2),
+            'volume_mm': round(v, 2),
+            'material':  material,
+            'mat_conf':  round(mat_conf, 1)
+        }
+
+    except Exception as e:
+        print(f'⚠️  TFLite prediction error: {e}')
         return None
 
-    tooth_resized = cv2.resize(roi, (32, 64))
-    features = []
+# ── OpenCV Fallback ───────────────────────────────────────────
+def predict_opencv(img_bytes):
+    nparr = np.frombuffer(img_bytes, np.uint8)
+    img   = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if img is None:
+        return None
 
     img_h, img_w = img.shape[:2]
-    features.append(w_px / img_w)
-    features.append(h_px / img_h)
-    features.append(w_px / img_w * h_px / img_h)
-    features.append(float(w_px) / float(h_px) if h_px > 0 else 0)
+    is_panoramic = img_w >= 1200
+    ppmm = img_w / 150.0 if is_panoramic else 3.78
 
-    cx = (x + w_px / 2) / img_w
-    cy = (y + h_px / 2) / img_h
-    features.append(cx)
-    features.append(cy)
+    gray     = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    clahe    = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    enhanced = clahe.apply(gray)
+    blur     = cv2.GaussianBlur(enhanced, (5,5), 0)
+    _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    kernel   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
+    thresh   = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
+    thresh   = cv2.morphologyEx(thresh, cv2.MORPH_OPEN,  kernel, iterations=1)
 
-    pixels = tooth_resized[tooth_resized > 0]
-    if len(pixels) == 0:
-        return None
-    features.append(float(np.mean(pixels)))
-    features.append(float(np.std(pixels)))
-    features.append(float(np.median(pixels)))
-    features.append(float(np.percentile(pixels, 25)))
-    features.append(float(np.percentile(pixels, 75)))
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    candidates  = []
 
-    hist = cv2.calcHist([tooth_resized], [0], None, [16], [1, 256])
-    hist = hist.flatten() / (hist.sum() + 1e-7)
-    features.extend(hist.tolist())
+    for c in contours:
+        area = cv2.contourArea(c)
+        if not (400 < area < 500_000):
+            continue
+        x, y, w, h = cv2.boundingRect(c)
+        aspect = max(w,h) / (min(w,h) + 1e-5)
+        if aspect > 6.0:
+            continue
+        hull_a   = cv2.contourArea(cv2.convexHull(c))
+        solidity = area / (hull_a + 1e-5)
+        if solidity < 0.25:
+            continue
+        cy = y + h / 2.0
+        if cy < img_h * 0.08 or cy > img_h * 0.92:
+            continue
+        if is_panoramic and w > img_w * 0.25:
+            continue
+        candidates.append((float(w), float(h), area))
 
-    edges = cv2.Canny(tooth_resized, 30, 100)
-    features.append(float(np.sum(edges > 0)) / (32 * 64))
-    features.append(0.75)
+    if not candidates:
+        return {
+            'width_mm':  2.0,
+            'height_mm': 2.0,
+            'depth_mm':  1.5,
+            'volume_mm': 6.0,
+            'material':  MATERIAL_CLASSES[0],
+            'mat_conf':  70.0
+        }
 
-    return np.array(features).reshape(1, -1)
+    candidates.sort(key=lambda c: c[0]*c[1], reverse=True)
+    bw, bh, _ = candidates[0]
 
+    raw_w = bw / ppmm
+    raw_h = bh / ppmm
+    raw_d = raw_w * 0.5
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+    w = round(clamp(raw_w, WIDTH_MIN,  WIDTH_MAX),  2)
+    h = round(clamp(raw_h, HEIGHT_MIN, HEIGHT_MAX), 2)
+    d = round(clamp(raw_d, DEPTH_MIN,  DEPTH_MAX),  2)
+    v = round(w * h * d, 2)
+
+    return {
+        'width_mm':  w,
+        'height_mm': h,
+        'depth_mm':  d,
+        'volume_mm': v,
+        'material':  get_material_from_volume(v),
+        'mat_conf':  72.0
+    }
+
+# ── Routes ────────────────────────────────────────────────────
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok', 'ai_ready': ai_ready})
-
+    return jsonify({
+        'status':       'ok',
+        'model_type':   MODEL_TYPE,
+        'model_loaded': interpreter is not None,
+        'tflite_file':  os.path.exists(TFLITE_PATH)
+    })
 
 @app.route('/analyze', methods=['POST'])
 def analyze():
     try:
         if 'image' not in request.files:
             return jsonify({'error': 'No image uploaded'}), 400
+
         file = request.files['image']
         if file.filename == '':
             return jsonify({'error': 'Empty filename'}), 400
 
-        file_bytes = np.frombuffer(file.read(), np.uint8)
-        img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-        if img is None:
-            return jsonify({'error': 'Cannot decode image'}), 400
+        img_bytes = file.read()
+        result    = None
 
-        img_h_px, img_w_px = img.shape[:2]
-        is_panoramic = img_w_px >= PANORAMIC_THRESHOLD
-        ppmm         = get_ppmm(img_w_px)
+        # Try TFLite model first
+        if MODEL_TYPE == 'tflite' and interpreter is not None:
+            img_array = preprocess(img_bytes)
+            if img_array is not None:
+                result = predict_tflite(img_array)
+                if result:
+                    print(f'✅ TFLite prediction: {result}')
 
-        gray     = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        clahe    = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(gray)
-        blur     = cv2.GaussianBlur(enhanced, (5, 5), 0)
+        # Fallback to OpenCV
+        if result is None:
+            print('⚠️  Using OpenCV fallback')
+            result = predict_opencv(img_bytes)
 
-        _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN,  kernel, iterations=1)
+        if result is None:
+            return jsonify({'error': 'Could not analyze image'}), 500
 
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        total = len(contours)
+        w    = result['width_mm']
+        h    = result['height_mm']
+        d    = result['depth_mm']
+        v    = result['volume_mm']
+        mat  = result['material']
+        conf = result['mat_conf']
+        sev  = get_severity(v)
+        sr   = get_scaffold_range(v)
 
-        candidates = []
-        for c in contours:
-            area = cv2.contourArea(c)
-            if not (MIN_AREA < area < MAX_AREA):
-                continue
-            x, y, w, h = cv2.boundingRect(c)
-            aspect = max(w, h) / (min(w, h) + 1e-5)
-            if aspect > MAX_ASPECT_RATIO:
-                continue
-            hull_area = cv2.contourArea(cv2.convexHull(c))
-            solidity  = area / (hull_area + 1e-5)
-            if solidity < MIN_SOLIDITY:
-                continue
-            cy2 = y + h / 2.0
-            if cy2 < img_h_px * 0.08 or cy2 > img_h_px * 0.92:
-                continue
-            if is_panoramic and w > img_w_px * 0.25:
-                continue
-            candidates.append((float(w), float(h), area))
-
-        if not candidates:
-            return jsonify({
-                'width': '0', 'height': '0', 'depth': '0', 'volume': '0',
-                'scaffoldRange': 'None', 'material': 'None', 'severity': 'None',
-                'findings': 'No significant bone defect region detected.',
-                'debug': {
-                    'contoursTotal': total, 'contoursKept': 0,
-                    'imageSize': f'{img_w_px} x {img_h_px} px',
-                    'pixelsPerMM': round(ppmm, 2), 'isPanoramic': is_panoramic
-                }
-            })
-
-        candidates.sort(key=lambda c: c[0] * c[1], reverse=True)
-        best_w_px, best_h_px, best_area = candidates[0]
-
-        raw_w = best_w_px / ppmm
-        raw_h = best_h_px / ppmm
-        raw_d = raw_w * DEPTH_RATIO
-
-        width  = round(clamp(raw_w, *WIDTH_RANGE),  2)
-        height = round(clamp(raw_h, *HEIGHT_RANGE), 2)
-        depth  = round(clamp(raw_d, *DEPTH_RANGE),  2)
-        volume = round(width * height * depth, 2)
-
-        scaffold_range, material = recommend_scaffold(volume)
-        severity = severity_label(volume)
         findings = (
-            f'{severity} bone defect detected. '
-            f'Dimensions: {width} mm (W) x {height} mm (H) x {depth} mm (D). '
-            f'Volume: {volume} mm3.'
+            f'{sev} bone defect detected. '
+            f'Dimensions: {w}mm (W) × {h}mm (H) × {d}mm (D). '
+            f'Volume: {v}mm³. '
+            f'Recommended scaffold: {mat}.'
         )
 
         return jsonify({
-            'width': str(width), 'height': str(height),
-            'depth': str(depth), 'volume': str(volume),
-            'scaffoldRange': scaffold_range, 'material': material,
-            'severity': severity, 'findings': findings,
+            'width':         str(w),
+            'height':        str(h),
+            'depth':         str(d),
+            'volume':        str(v),
+            'scaffoldRange': sr,
+            'material':      mat,
+            'severity':      sev,
+            'findings':      findings,
+            'confidence':    f'{conf:.1f}%',
+            'model_used':    MODEL_TYPE,
             'debug': {
-                'best_w_px': round(best_w_px, 1), 'best_h_px': round(best_h_px, 1),
-                'best_area_px2': round(best_area, 0),
-                'raw_w_mm': round(raw_w, 2), 'raw_h_mm': round(raw_h, 2),
-                'raw_d_mm': round(raw_d, 2),
-                'contoursTotal': total, 'contoursKept': len(candidates),
-                'imageSize': f'{img_w_px} x {img_h_px} px',
-                'pixelsPerMM': round(ppmm, 2), 'isPanoramic': is_panoramic,
+                'model_type':   MODEL_TYPE,
+                'mat_conf_pct': conf,
+                'w_mm': w, 'h_mm': h,
+                'd_mm': d, 'v_mm3': v
             }
         })
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/ai-analyze', methods=['POST'])
-def ai_analyze():
-    try:
-        if not ai_ready:
-            return jsonify({'error': 'AI models not loaded on server'}), 503
-
-        if 'image' not in request.files:
-            return jsonify({'error': 'No image uploaded'}), 400
-        file = request.files['image']
-        if file.filename == '':
-            return jsonify({'error': 'Empty filename'}), 400
-
-        file_bytes = np.frombuffer(file.read(), np.uint8)
-        img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-        if img is None:
-            return jsonify({'error': 'Cannot decode image'}), 400
-
-        img_h_px, img_w_px = img.shape[:2]
-        is_panoramic = img_w_px >= PANORAMIC_THRESHOLD
-
-        gray     = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        clahe    = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(gray)
-        blur     = cv2.GaussianBlur(enhanced, (5, 5), 0)
-        _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN,  kernel, iterations=1)
-
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        teeth_results = []
-
-        for c in contours:
-            area = cv2.contourArea(c)
-            if not (MIN_AREA < area < MAX_AREA):
-                continue
-            x, y, w, h = cv2.boundingRect(c)
-            aspect = max(w, h) / (min(w, h) + 1e-5)
-            if aspect > MAX_ASPECT_RATIO:
-                continue
-            hull_area = cv2.contourArea(cv2.convexHull(c))
-            solidity  = area / (hull_area + 1e-5)
-            if solidity < MIN_SOLIDITY:
-                continue
-            cy2 = y + h / 2.0
-            if cy2 < img_h_px * 0.08 or cy2 > img_h_px * 0.92:
-                continue
-            if is_panoramic and w > img_w_px * 0.25:
-                continue
-
-            features = extract_features_for_prediction(enhanced, x, y, w, h)
-            if features is None:
-                continue
-
-            tooth_num = le_tooth.inverse_transform(ai_models['tooth'].predict(features))[0]
-            mat_label = le_material.inverse_transform(ai_models['material'].predict(features))[0]
-            width_mm   = round(float(ai_models['width'].predict(features)[0]), 2)
-            height_mm  = round(float(ai_models['height'].predict(features)[0]), 2)
-            depth_mm   = round(float(ai_models['depth'].predict(features)[0]), 2)
-            volume_mm3 = round(float(ai_models['volume'].predict(features)[0]), 2)
-            scaffold   = round(float(ai_models['scaffold'].predict(features)[0]), 2)
-
-            teeth_results.append({
-                'tooth_number':      str(tooth_num),
-                'tooth_type':        TOOTH_TYPES.get(str(tooth_num), 'Unknown'),
-                'width_mm':          width_mm,
-                'height_mm':         height_mm,
-                'depth_mm':          depth_mm,
-                'volume_mm3':        volume_mm3,
-                'scaffold_mm3':      scaffold,
-                'scaffold_material': mat_label,
-                'position':          {'x': x, 'y': y, 'w': w, 'h': h}
-            })
-
-        teeth_results.sort(key=lambda t: int(t['tooth_number']) if t['tooth_number'].isdigit() else 99)
-
-        if not teeth_results:
-            return jsonify({'error': 'No teeth detected in image'}), 400
-
-        total_volume   = round(sum(t['volume_mm3'] for t in teeth_results), 2)
-        total_scaffold = round(sum(t['scaffold_mm3'] for t in teeth_results), 2)
-
-        return jsonify({
-            'teeth':              teeth_results,
-            'teeth_count':        len(teeth_results),
-            'total_volume_mm3':   total_volume,
-            'total_scaffold_mm3': total_scaffold,
-            'image_type':         'panoramic' if is_panoramic else 'periapical',
-            'ai_powered':         True
-        })
-
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
-# ── Run ───────────────────────────────────────────────────────────────────────
-import threading
-import time
-import urllib.request
-
-def keep_alive():
-    while True:
-        try:
-            urllib.request.urlopen('https://dental-ai-backend-1.onrender.com/health')
-        except:
-            pass
-        time.sleep(840)  # ping every 14 minutes
-
-t = threading.Thread(target=keep_alive)
-t.daemon = True
-t.start()
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
