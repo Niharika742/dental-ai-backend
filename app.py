@@ -6,7 +6,7 @@ import os
 import urllib.request
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, origins="*", supports_credentials=False)
 
 # ── Configuration ─────────────────────────────────────────────
 IMG_SIZE = 224
