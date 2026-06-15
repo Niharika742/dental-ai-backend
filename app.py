@@ -50,8 +50,8 @@ def load_tflite():
     global interpreter, MODEL_TYPE
     if os.path.exists(TFLITE_PATH):
         try:
-            import tensorflow as tf
-            interpreter = tf.lite.Interpreter(model_path=TFLITE_PATH)
+            import tflite_runtime.interpreter as tflite
+interpreter = tflite.Interpreter(model_path=TFLITE_PATH)
             interpreter.allocate_tensors()
             inp = interpreter.get_input_details()
             out = interpreter.get_output_details()
